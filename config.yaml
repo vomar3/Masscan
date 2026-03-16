@@ -1,0 +1,23 @@
+masscan:
+  path: "/mnt/c/Users/Ardor/Downloads/masscan-1.3.2/bin/masscan"
+
+scanner:
+  rate: 1000
+  ports: "80"
+  targets:
+    - "192.168.1.1"
+
+workers:
+  count: 10
+  queue_size: 200
+
+telegram:
+  enabled: true
+  chat_id: "1206786308"
+
+email:
+  enabled: true
+  to: "test@mailtrap.io"
+
+storage:
+  file: "results.json"

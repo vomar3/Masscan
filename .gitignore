@@ -1,0 +1,5 @@
+.env
+scan_*.json
+results.json
+masscan.exe
+.exe
