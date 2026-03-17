@@ -1,12 +1,15 @@
 package scanner
 
 import (
+	"context"
+	"os"
 	"os/exec"
 	"strconv"
 )
 
-func RunMasscan(masscanPath string, target string, ports string, rate int, output string) error {
-	cmd := exec.Command(
+func RunMasscan(ctx context.Context, masscanPath string, target string, ports string, rate int, output string) error {
+	cmd := exec.CommandContext(
+		ctx,
 		"wsl",
 		masscanPath,
 		target,
@@ -17,5 +20,15 @@ func RunMasscan(masscanPath string, target string, ports string, rate int, outpu
 		output,
 	)
 
-	return cmd.Run()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+
+	return nil
 }

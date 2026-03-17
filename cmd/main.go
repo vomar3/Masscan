@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"masscan/internal/banner"
 	"masscan/internal/config"
@@ -61,11 +66,17 @@ func exists(old []models.ScanResult, r models.ScanResult) bool {
 	return false
 }
 
-func main() {
+func run(ctx context.Context) error {
 	cfg, err := config.LoadConfig("config.yaml")
 	if err != nil {
-		panic(fmt.Errorf("failed to load config: %w", err))
+		return fmt.Errorf("failed to load config: %w", err)
 	}
+
+	store, err := storage.New(cfg.Storage.DBPath)
+	if err != nil {
+		return fmt.Errorf("failed to init storage: %w", err)
+	}
+	defer store.Close()
 
 	var notifiers []notifier.Notifier
 
@@ -88,11 +99,23 @@ func main() {
 	fmt.Println("Starting scan...")
 
 	var files []string
+	defer func() {
+		for _, file := range files {
+			_ = os.Remove(file)
+		}
+	}()
 
 	for i, target := range cfg.Scanner.Targets {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("scan canceled before target %s: %w", target, ctx.Err())
+		default:
+		}
+
 		file := fmt.Sprintf("scan_%d.json", i)
 
 		err := scanner.RunMasscan(
+			ctx,
 			cfg.Masscan.Path,
 			target,
 			cfg.Scanner.Ports,
@@ -100,16 +123,22 @@ func main() {
 			file,
 		)
 		if err != nil {
-			panic(fmt.Errorf("masscan failed for target %s: %w", target, err))
+			if ctx.Err() != nil {
+				return fmt.Errorf("masscan canceled for target %s: %w", target, ctx.Err())
+			}
+			return fmt.Errorf("masscan failed for target %s: %w", target, err)
 		}
 
 		files = append(files, file)
 	}
 
-	oldResults, err := storage.Load(cfg.Storage.File)
+	if err := store.ImportLegacyJSONIfEmpty(ctx, cfg.Storage.File); err != nil {
+		return fmt.Errorf("failed to import legacy results: %w", err)
+	}
+
+	oldResults, err := store.LoadCurrent(ctx)
 	if err != nil {
-		fmt.Println("Warning: failed to load previous results:", err)
-		oldResults = []models.ScanResult{}
+		return fmt.Errorf("failed to load previous results: %w", err)
 	}
 
 	tasks := make(chan BannerTask, cfg.Workers.QueueSize)
@@ -123,35 +152,49 @@ func main() {
 		go func() {
 			defer workerWG.Done()
 
-			for task := range tasks {
-				bannerText := banner.GrabBanner(task.IP, task.Port)
-				service := detectService(task.Port, bannerText)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task, ok := <-tasks:
+					if !ok {
+						return
+					}
 
-				resultsChan <- models.ScanResult{
-					IP:      task.IP,
-					Port:    task.Port,
-					Service: service,
-					Banner:  bannerText,
+					bannerText := banner.GrabBanner(task.IP, task.Port)
+					service := detectService(task.Port, bannerText)
+
+					result := models.ScanResult{
+						IP:      task.IP,
+						Port:    task.Port,
+						Service: service,
+						Banner:  bannerText,
+					}
+
+					select {
+					case <-ctx.Done():
+						return
+					case resultsChan <- result:
+					}
 				}
 			}
 		}()
 	}
 
-	taskCount := 0
-
+outer:
 	for _, file := range files {
 		results, err := scanner.ParseResults(file)
 		if err != nil {
-			panic(fmt.Errorf("failed to parse %s: %w", file, err))
+			return fmt.Errorf("failed to parse %s: %w", file, err)
 		}
 
 		for _, r := range results {
 			for _, p := range r.Ports {
-				tasks <- BannerTask{
-					IP:   r.IP,
-					Port: p.Port,
+				select {
+				case <-ctx.Done():
+					break outer
+				case tasks <- BannerTask{IP: r.IP, Port: p.Port}:
 				}
-				taskCount++
 			}
 		}
 	}
@@ -166,6 +209,10 @@ func main() {
 	var scanResults []models.ScanResult
 	for res := range resultsChan {
 		scanResults = append(scanResults, res)
+	}
+
+	if ctx.Err() != nil {
+		return fmt.Errorf("scan interrupted: %w", ctx.Err())
 	}
 
 	fmt.Printf("Collected %d scan results\n", len(scanResults))
@@ -191,11 +238,27 @@ func main() {
 		}
 	}
 
-	if err := storage.Save(cfg.Storage.File, scanResults); err != nil {
-		panic(fmt.Errorf("failed to save results to %s: %w", cfg.Storage.File, err))
+	if err := store.ReplaceCurrent(ctx, scanResults); err != nil {
+		return fmt.Errorf("failed to persist results to %s: %w", cfg.Storage.DBPath, err)
 	}
 
-	fmt.Println("Results saved to", cfg.Storage.File)
+	fmt.Println("Results saved to", cfg.Storage.DBPath)
 	fmt.Println("Scan finished")
-	_ = taskCount
+
+	return nil
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Println("Graceful shutdown complete")
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 }

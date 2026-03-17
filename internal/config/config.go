@@ -34,7 +34,8 @@ type Config struct {
 	} `yaml:"email"`
 
 	Storage struct {
-		File string `yaml:"file"`
+		DBPath string `yaml:"db_path"`
+		File   string `yaml:"file"`
 	} `yaml:"storage"`
 
 	TelegramToken   string
@@ -54,6 +55,13 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+
+	if cfg.Storage.DBPath == "" {
+		cfg.Storage.DBPath = "results.db"
+	}
+	if cfg.Storage.File == "" {
+		cfg.Storage.File = "results.json"
 	}
 
 	cfg.TelegramToken = os.Getenv("TELEGRAM_TOKEN")

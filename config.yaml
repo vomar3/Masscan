@@ -20,4 +20,5 @@ email:
   to: "test@mailtrap.io"
 
 storage:
+  db_path: "results.db"
   file: "results.json"
